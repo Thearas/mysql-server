@@ -39,6 +39,8 @@
 #include "compression.h"
 
 #include <algorithm>
+#include <cctype>
+#include <string>
 #include <chrono>
 #include <cmath>  // std::isinf
 #include <limits>
@@ -106,6 +108,17 @@
 #include "typelib.h"
 #include "violite.h"
 #include "welcome_copyright_notice.h"  // ORACLE_WELCOME_COPYRIGHT_NOTICE
+#include "client/httplib.h"
+#include "sql-common/json_binary.h"
+#include "sql-common/json_dom.h"
+#include "sql-common/json_error_handler.h"
+#include "sql-common/json_path.h"
+#include "sql_string.h"
+
+#ifndef JsonDepthErrorHandler
+void JsonDepthErrorHandler() { my_error(ER_JSON_DOCUMENT_TOO_DEEP, MYF(0)); }
+#endif
+
 
 #ifdef _WIN32
 #define SIGNAL_FMT "exception 0x%x"
@@ -196,11 +209,19 @@ static int record = 0;
 static char *opt_db = nullptr, *opt_pass = nullptr;
 const char *opt_user = nullptr, *opt_host = nullptr, *unix_sock = nullptr,
            *opt_basedir = "./";
+
+const char *doris_opt_pass = "";
+const char *doris_opt_user = "root", *doris_opt_host = "172.20.48.119";
+const char *doris_sql_convertor_url = "http://172.20.48.119:5001";
+
 const char *excluded_string = nullptr;
 static char *shared_memory_base_name = nullptr;
 const char *opt_logdir = "";
 const char *opt_include = nullptr, *opt_charsets_dir;
 static int opt_port = 0;
+
+static int doris_opt_port = 9030;
+
 static int opt_max_connect_retries;
 static int opt_result_format_version;
 static int opt_max_connections = DEFAULT_MAX_CONN;
@@ -268,6 +289,10 @@ static std::thread stacktrace_collector_thread;
 static std::atomic<bool> stacktrace_collector_thread_should_stop{};
 #endif
 
+bool record_doris_result = false;
+bool run_on_doris = false;
+Logfile doris_result_file;
+Logfile mysql_result_file;
 Logfile log_file;
 // File to store the progress
 Logfile progress_file;
@@ -437,6 +462,21 @@ struct st_connection {
 struct st_connection *connections = nullptr;
 struct st_connection *cur_con = nullptr, *next_con, *connections_end;
 
+struct st_connection *doris_connections = nullptr;
+struct st_connection *doris_cur_con = nullptr, *doris_next_con, *doris_connections_end;
+
+bool doris_has_prefix(const char* cstr, const char* cprefix) {
+  std::string str = cstr;
+  std::string prefix = cprefix;
+  if (prefix.size() > str.size()) return false;
+
+  auto caseInsensitiveCharCompare = [](char a, char b) {
+    return std::tolower(a) == std::tolower(b);
+  };
+
+  return std::mismatch(prefix.begin(), prefix.end(), str.begin(), caseInsensitiveCharCompare).first == prefix.end();
+}
+
 /*
   List of commands in mysqltest
   Must match the "command_names" array
@@ -587,11 +627,14 @@ struct st_command {
   enum enum_commands type;
   // Line number of the command
   uint lineno;
+  char *orig_query;
 };
 
 TYPELIB command_typelib = {array_elements(command_names), "", command_names,
                            nullptr};
 
+DYNAMIC_STRING doris_ds_res;
+DYNAMIC_STRING mysql_ds_res;
 DYNAMIC_STRING ds_res;
 DYNAMIC_STRING ds_result;
 /* Points to ds_warning in run_query, so it can be freed */
@@ -1293,6 +1336,11 @@ void handle_error(struct st_command *command, std::uint32_t err_errno,
                   DYNAMIC_STRING *ds) {
   DBUG_TRACE;
 
+  if (record_doris_result) {
+    // do not exit on doris
+    return;
+  }
+
   if (opt_hypergraph && err_errno == ER_HYPERGRAPH_NOT_SUPPORTED_YET) {
     const char errstr[] = "<ignored hypergraph optimizer error: ";
     dynstr_append_mem(ds, errstr, sizeof(errstr) - 1);
@@ -1464,12 +1512,36 @@ static void close_connections() {
     my_free(next_con->name);
   }
   my_free(connections);
+
+  if (doris_connections == nullptr) {
+    return;
+  }
+
+  doris_cur_con = nullptr;
+  for (--doris_next_con; doris_next_con >= doris_connections; --doris_next_con) {
+    if (doris_next_con->stmt) mysql_stmt_close(doris_next_con->stmt);
+    doris_next_con->stmt = nullptr;
+    mysql_close(&doris_next_con->mysql);
+    if (doris_next_con->util_mysql) mysql_close(doris_next_con->util_mysql);
+    my_free(doris_next_con->name);
+  }
+  my_free(doris_connections);
 }
 
 static void close_statements() {
   struct st_connection *con;
   DBUG_TRACE;
   for (con = connections; con < next_con; con++) {
+    if (con->stmt) mysql_stmt_close(con->stmt);
+    con->stmt = nullptr;
+  }
+
+  if (doris_connections == nullptr) {
+    return;
+  }
+
+  con = nullptr;
+  for (con = doris_connections; con < doris_next_con; con++) {
     if (con->stmt) mysql_stmt_close(con->stmt);
     con->stmt = nullptr;
   }
@@ -1523,6 +1595,8 @@ static void free_used_memory() {
   delete q_lines;
   dynstr_free(&ds_res);
   dynstr_free(&ds_result);
+  dynstr_free(&doris_ds_res);
+  dynstr_free(&mysql_ds_res);
   if (ds_warn) dynstr_free(ds_warn);
   free_all_replace();
   my_free(opt_pass);
@@ -1737,6 +1811,18 @@ void flush_ds_res() {
     }
 
     dynstr_set(&ds_res, nullptr);
+  }
+
+  if (doris_ds_res.length) {
+    if (doris_result_file.write(doris_ds_res.str, doris_ds_res.length) || doris_result_file.flush())
+        cleanup_and_exit(1);
+    dynstr_set(&doris_ds_res, nullptr);
+  }
+
+  if (mysql_ds_res.length) {
+    if (mysql_result_file.write(mysql_ds_res.str, mysql_ds_res.length) || mysql_result_file.flush())
+        cleanup_and_exit(1);
+    dynstr_set(&mysql_ds_res, nullptr);
   }
 }
 
@@ -6349,6 +6435,10 @@ static void set_current_connection(struct st_connection *con) {
   var_set_string("$CURRENT_CONNECTION", con->name);
 }
 
+static void doris_set_current_connection(struct st_connection *con) {
+  doris_cur_con = con;
+}
+
 static void select_connection_name(const char *name) {
   DBUG_TRACE;
   DBUG_PRINT("enter", ("name: '%s'", name));
@@ -7789,6 +7879,12 @@ static struct my_option my_long_options[] = {
      GET_NO_ARG, NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
     {"host", 'h', "Connect to host.", &opt_host, &opt_host, nullptr, GET_STR,
      REQUIRED_ARG, 0, 0, 0, nullptr, 0, nullptr},
+
+     {"doris-host", 0, "Connect to Doris host.", &doris_opt_host, &doris_opt_host, nullptr, GET_STR,
+     OPT_ARG, 0, 0, 0, nullptr, 0, nullptr},
+     {"sql-convertor-url", 0, "Doris SQL convertor URL.", &doris_sql_convertor_url, &doris_sql_convertor_url, nullptr, GET_STR,
+     OPT_ARG, 0, 0, 0, nullptr, 0, nullptr},
+
     {"hypergraph", OPT_HYPERGRAPH,
      "Force all queries to be run under the hypergraph optimizer.",
      &opt_hypergraph, &opt_hypergraph, nullptr, GET_BOOL, NO_ARG, 0, 0, 0,
@@ -7847,6 +7943,12 @@ static struct my_option my_long_options[] = {
      "built-in default (" STRINGIFY_ARG(MYSQL_PORT) ").",
      &opt_port, &opt_port, nullptr, GET_INT, REQUIRED_ARG, 0, 0, 0, nullptr, 0,
      nullptr},
+
+    {"doris-port", 0,
+     "Port number to use for Doris connection", 
+     &doris_opt_port, &doris_opt_port, nullptr, GET_INT,
+     REQUIRED_ARG, 0, 0, 0, nullptr, 0, nullptr},
+
     {"protocol", OPT_MYSQL_PROTOCOL,
      "The protocol of connection (tcp,socket,pipe,memory).", nullptr, nullptr,
      nullptr, GET_STR, REQUIRED_ARG, 0, 0, 0, nullptr, 0, nullptr},
@@ -8704,7 +8806,15 @@ static void run_query_normal(struct st_connection *cn,
         if (!display_result_vertically)
           append_table_headings(ds, fields, num_fields);
 
+        auto orig_len = ds->length;
         append_result(ds, res);
+        if (run_on_doris && !expected_errors->count()) {
+          if (record_doris_result) {
+            dynstr_append(&doris_ds_res, ds->str+orig_len);
+          } else {
+            dynstr_append(&mysql_ds_res, ds->str+orig_len);
+          }
+        }
       }
 
       // Need to call mysql_affected_rows() before the "new"
@@ -8866,7 +8976,15 @@ static void run_query_stmt(MYSQL *mysql, struct st_command *command,
         if (!display_result_vertically)
           append_table_headings(ds, fields, num_fields);
 
+        auto orig_len = ds->length;
         append_stmt_result(ds, stmt, fields, num_fields);
+        if (run_on_doris && !expected_errors->count()) {
+          if (record_doris_result) {
+            dynstr_append(&doris_ds_res, ds->str+orig_len);
+          } else {
+            dynstr_append(&mysql_ds_res, ds->str+orig_len);
+          }
+        }
 
         // Free normal result set with meta data
         mysql_free_result_wrapper(res);
@@ -9033,6 +9151,16 @@ static void run_query(struct st_connection *cn, struct st_command *command,
     replace_dynstr_append_mem(ds, query, query_len);
     dynstr_append_mem(ds, delimiter, delimiter_length);
     dynstr_append_mem(ds, "\n", 1);
+
+    if (run_on_doris) {
+      auto ds_ = record_doris_result ? &doris_ds_res : &mysql_ds_res;
+      auto q = record_doris_result ? command->orig_query : query;
+      dynstr_append(ds_, q);
+      dynstr_append_mem(ds_, delimiter, delimiter_length);
+      dynstr_append_mem(ds_, "\n", 1);
+      if (expected_errors->count())
+        dynstr_append(ds_, "<ignore expected errors>\n");
+    }
   }
 
   if (skip_if_hypergraph && opt_hypergraph) {
@@ -9567,6 +9695,8 @@ int main(int argc, char **argv) {
 #endif
 
   init_dynamic_string(&ds_res, "", 2048);
+  init_dynamic_string(&doris_ds_res, "", 2048);
+  init_dynamic_string(&mysql_ds_res, "", 2048);
   init_dynamic_string(&ds_result, "", 1024);
 
   global_attrs = new client_query_attributes();
@@ -9585,6 +9715,13 @@ int main(int argc, char **argv) {
       MYF(MY_WME | MY_ZEROFILL));
   connections_end = connections + opt_max_connections + 1;
   next_con = connections + 1;
+
+  doris_connections = (struct st_connection *)my_malloc(
+      PSI_NOT_INSTRUMENTED,
+      (opt_max_connections + 2) * sizeof(struct st_connection),
+      MYF(MY_WME | MY_ZEROFILL));
+  doris_connections_end = doris_connections + opt_max_connections + 1;
+  doris_next_con = doris_connections + 1;
 
   var_set_int("$PS_PROTOCOL", ps_protocol);
   var_set_int("$SP_PROTOCOL", sp_protocol);
@@ -9624,6 +9761,10 @@ int main(int argc, char **argv) {
 
   // Creating a log file using current file name if result file doesn't exist.
   if (result_file_name) {
+    if (doris_result_file.open(opt_logdir, result_file_name, ".doris.result"))
+      cleanup_and_exit(1);
+    if (mysql_result_file.open(opt_logdir, result_file_name, ".mysql.result"))
+      cleanup_and_exit(1);
     if (log_file.open(opt_logdir, result_file_name, ".log"))
       cleanup_and_exit(1);
   } else {
@@ -9711,6 +9852,25 @@ int main(int argc, char **argv) {
           &con->mysql, [](const char *err) { die("%s", err); }))
     return 0;
 
+  if (doris_opt_port == 0) {
+    doris_opt_port = 9030;
+  }
+  DBUG_PRINT("doris",
+             ("host: '%s', port: '%d', sql_convertor_url: '%s'", doris_opt_host, doris_opt_port, doris_sql_convertor_url));
+  st_connection *doris_con = doris_connections;
+  if (!(mysql_init(&doris_con->mysql))) die("Failed in mysql_init()");
+  if (opt_init_command)
+    mysql_options(&doris_con->mysql, MYSQL_INIT_COMMAND, opt_init_command);
+  if (opt_connect_timeout)
+    mysql_options(&doris_con->mysql, MYSQL_OPT_CONNECT_TIMEOUT,
+                  (void *)&opt_connect_timeout);
+  if (opt_protocol)
+    mysql_options(&doris_con->mysql, MYSQL_OPT_PROTOCOL, (char *)&opt_protocol);
+  if (!(doris_con->name = my_strdup(PSI_NOT_INSTRUMENTED, "doris_default", MYF(MY_WME))))
+    die("Out of memory");
+  safe_connect(&doris_con->mysql, doris_con->name, doris_opt_host, doris_opt_user, doris_opt_pass, opt_db,
+               doris_opt_port, unix_sock);
+
   /* Use all time until exit if no explicit 'start_timer' */
   timer_start = timer_now();
 
@@ -9722,6 +9882,7 @@ int main(int argc, char **argv) {
   var_set_errno(-1);
 
   set_current_connection(con);
+  doris_set_current_connection(doris_con);
 
   if (opt_hypergraph) {
     const int error = mysql_query_wrapper(
@@ -10032,12 +10193,101 @@ int main(int argc, char **argv) {
             strmake(command->output_file, output_file, sizeof(output_file) - 1);
             *output_file = 0;
           }
+
+          run_on_doris = doris_has_prefix(command->query, "SELECT") ||
+            (doris_has_prefix(command->query, "INSERT") && strcasestr(command->query, "SELECT"));
+          display_result_sorted = true;
+          start_sort_column = 0;
+
           run_query(cur_con, command, flags);
           display_opt_trace(cur_con, command, flags);
+
+          // Run 'SELECT' and 'INSERT INTO ... SELECT' on doris catalog either.
+          auto orig_query = command->query;
+          char *new_query = nullptr;
+          // NOTE: also run 'set var' on doris, but not record result
+          bool is_set_var = (doris_has_prefix(command->query, "SET") && strchr(command->query, '@'));
+          run_on_doris = run_on_doris || is_set_var;
+          if (run_on_doris) {
+            // convert to doris sql
+            Json_object_ptr obj = create_dom_ptr<Json_object>();
+            obj->add_alias("sql_query", create_dom_ptr<Json_string>(command->query));
+            obj->add_alias("from", create_dom_ptr<Json_string>("doris"));
+            obj->add_alias("to", create_dom_ptr<Json_string>("doris"));
+            obj->add_alias("version", create_dom_ptr<Json_string>("1.0.1"));
+            obj->add_alias("source", create_dom_ptr<Json_string>("text"));
+            obj->add_alias("case_sensitive", create_dom_ptr<Json_string>("0"));
+
+            Json_wrapper encoder = Json_wrapper(std::move(obj));
+            encoder.set_alias();
+            String body;
+            encoder.to_string(&body, true, String().ptr(), JsonDepthErrorHandler);
+
+            httplib::Client cli(doris_sql_convertor_url);
+            if (auto res = cli.Post("/api/v1/convert", body.length(), 
+              [&](size_t offset, size_t length, httplib::DataSink &sink) {
+                sink.write(body.ptr() + offset, length);
+                return true;
+              },
+              "text/plain;charset=UTF-8")) {
+                
+              if (res->status != httplib::StatusCode::OK_200) {
+                verbose_msg("Convert sql '%s' failed, code: %d\n", command->query, res->status);
+                goto skip_doris;
+              }
+              Json_dom_ptr j = Json_dom::parse(
+                res->body.c_str(), res->body.length(),
+                [](const char *, size_t) {}, JsonDepthErrorHandler);
+              if (j == nullptr || j->json_type() != enum_json_type::J_OBJECT) {
+                verbose_msg("Convert sql '%s' failed, body: %s\n", command->query, res->body.c_str());
+                goto skip_doris;
+              }
+              Json_object *resp = down_cast<Json_object *>(j.get());
+
+              Json_dom *msg = resp->get("message");
+              Json_string *msg_str = static_cast<Json_string *>(msg);
+
+              if (strcmp(msg_str->value().c_str(), "success") != 0) {
+                verbose_msg("Convert sql '%s' failed: %s\n", command->query, msg_str->value().c_str());
+                goto skip_doris;
+              }
+            
+              Json_dom *data = resp->get("data");
+              Json_string *data_str = static_cast<Json_string *>(data);
+
+              // set to converted doris query
+              new_query = (char *)malloc(data_str->value().length() + 1);
+              strcpy(new_query, data_str->value().c_str());
+              command->query = new_query;
+            }
+
+            // run on doris
+            bool orig_abort_on_error = command->abort_on_error;
+            record_doris_result = !is_set_var;
+            command->orig_query = orig_query;
+            command->abort_on_error = false;
+
+            // sort
+            display_result_sorted = true;
+            start_sort_column = 0;
+
+            run_query(doris_cur_con, command, flags);
+            command->abort_on_error = orig_abort_on_error;
+          }
+
+skip_doris:
+          if (new_query) {
+            // set back to original mysql query
+            command->query = orig_query;
+            free(new_query);
+          }
           command_executed++;
           command->last_argument = command->end;
 
           /* Restore settings */
+          record_doris_result = false;
+          run_on_doris = false;
+          display_result_sorted = false;
           display_result_vertically = old_display_result_vertically;
 
           break;

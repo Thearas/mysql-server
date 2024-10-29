@@ -43,27 +43,6 @@ MYSQL_ADD_EXECUTABLE(mysql
   LINK_LIBRARIES mysqlclient ${EDITLINE_LIBRARY}
   )
 
-MYSQL_ADD_EXECUTABLE(mysqltest
-  mysqltest.cc
-  mysqltest/error_names.cc
-  mysqltest/expected_errors.cc
-  mysqltest/expected_warnings.cc
-  mysqltest/logfile.cc
-  mysqltest/regular_expressions.cc
-  mysqltest/secondary_engine.cc
-  mysqltest/utils.cc
-  client_query_attributes.cc
-
-  COMPONENT Test
-  DEPENDENCIES GenError GenClientError
-  ENABLE_EXPORTS
-  LINK_LIBRARIES mysqlclient
-  )
-
-IF(MY_COMPILER_IS_GNU AND (WITH_LTO OR CMAKE_COMPILER_FLAG_WITH_LTO))
-  TARGET_LINK_OPTIONS(mysqltest PRIVATE -Wno-error=stringop-overflow)
-ENDIF()
-
 MYSQL_ADD_EXECUTABLE(mysqlcheck
   check/mysqlcheck.cc
   check/mysqlcheck_core.cc
@@ -155,6 +134,32 @@ ADD_CONVENIENCE_LIBRARY(json_client_library
 ADD_CONVENIENCE_LIBRARY(decimal
   ${CMAKE_SOURCE_DIR}/sql-common/my_decimal.cc
   )
+
+MYSQL_ADD_EXECUTABLE(mysqltest
+  mysqltest.cc
+  mysqltest/error_names.cc
+  mysqltest/expected_errors.cc
+  mysqltest/expected_warnings.cc
+  mysqltest/logfile.cc
+  mysqltest/regular_expressions.cc
+  mysqltest/secondary_engine.cc
+  mysqltest/utils.cc
+  client_query_attributes.cc
+
+  COMPONENT Test
+  DEPENDENCIES GenError GenClientError
+  ENABLE_EXPORTS
+  LINK_LIBRARIES mysqlclient json_client_library decimal
+)
+
+IF(MY_COMPILER_IS_GNU AND (WITH_LTO OR CMAKE_COMPILER_FLAG_WITH_LTO))
+  TARGET_LINK_OPTIONS(mysqltest PRIVATE -Wno-error=stringop-overflow)
+ENDIF()
+IF(LINUX)
+  TARGET_LINK_OPTIONS(mysqltest PRIVATE -static)
+ENDIF()
+# TARGET_LINK_OPTIONS(mysqltest PRIVATE -static-libgcc)
+
 
 SET(JSON_BINLOG_LIBS_TO_MERGE
   json_client_library
